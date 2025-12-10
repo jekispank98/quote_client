@@ -15,6 +15,7 @@ impl TickerParser for Ticker {
         for line_result in reader.lines() {
             let line = line_result.map_err(ParserError::Io)?;
             let trimmed_line = line.trim();
+            println!("trimmed_line: {}", trimmed_line);
             if trimmed_line.is_empty() {
                 continue;
             }
