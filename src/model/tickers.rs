@@ -1,3 +1,9 @@
+//! Ticker symbols and helpers for parsing them from files and CLI.
+//!
+//! The `Ticker` enum covers a set of common symbols and supports parsing from
+//! strings (case-insensitive) as well as `clap` value enumeration for CLI options.
+//! The `TickerParser` trait adds a convenience method to parse tickers from any
+//! `BufRead` source line-by-line.
 use crate::error::ParserError;
 use bincode::{Decode, Encode};
 use clap::ValueEnum;
@@ -5,9 +11,15 @@ use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use strum::{Display, EnumString};
 
+/// Trait providing file parsing for tickers.
 pub trait TickerParser {
+    /// Parses tickers from a buffered reader.
+    ///
+    /// Each non-empty line is parsed as a single `Ticker` value using `FromStr`.
+    /// Returns an error if any line cannot be parsed.
     fn parse_from_file<R: BufRead>(reader: R) -> Result<Vec<Ticker>, ParserError>;
 }
+
 impl TickerParser for Ticker {
     fn parse_from_file<R: BufRead>(reader: R) -> Result<Vec<Self>, ParserError> {
         let mut tickers = Vec::new();
@@ -31,6 +43,11 @@ impl TickerParser for Ticker {
     }
 }
 
+/// Set of supported ticker symbols.
+///
+/// Note: We intentionally don't document each variant to keep the docs concise.
+/// Variant-level missing docs are allowed for this enum.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Decode, Encode, Serialize, Deserialize, ValueEnum, Display, EnumString)]
 #[clap(rename_all = "lower")]
 #[strum(ascii_case_insensitive)]

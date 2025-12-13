@@ -1,64 +1,128 @@
-extern crate alloc;
-extern crate core;
+//! Quote Client — a UDP client that subscribes to stock quotes from a server and prints
+//! received quotes to stdout. It reads a list of tickers from a text file, sends an
+//! initial `J_QUOTE` subscription command to the server, keeps the connection alive
+//! with periodic `PING`s, and continuously listens for incoming quotes.
+//!
+//! Usage example (CLI):
+//! ```bash
+//! quote_client --server-ip 192.168.0.10 --listen-port 55555 --path ./tickers.txt
+//! ```
+//!
+//! The ticker file should contain symbols separated by commas, spaces, or new lines.
+//! See `model::tickers` for details.
+#![warn(missing_docs)]
+mod args;
+mod error;
+mod model;
+mod sender;
+mod result;
 
 use crate::args::Args;
 use crate::error::ParserError;
 use crate::model::command::Command;
-use crate::model::tickers::Ticker;
-use crate::model::tickers::TickerParser;
+use crate::model::quote::Quote;
+use crate::model::tickers::{Ticker, TickerParser};
 use crate::sender::CommandSender;
 use clap::Parser;
 use std::fs::File;
 use std::io::BufReader;
+use std::io::ErrorKind;
+use std::net::UdpSocket;
 use std::path::PathBuf;
-use std::thread::spawn;
-use std::time::Duration;
+use result::Result;
 
-mod args;
-mod error;
-pub mod model;
-mod result;
-mod sender;
+/// UDP port on which the quote server is expected to listen.
+const SERVER_PORT: &str = "8080";
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Runs a blocking loop that receives `Quote` messages from the given UDP `socket`
+/// and prints them to stdout. Returns an error if receiving or decoding fails.
+fn start_receiver_loop(socket: UdpSocket) -> Result<(), ParserError> {
+    println!(
+        "Quote receiver running on the port: {}",
+        socket.local_addr()?
+    );
+    let mut buf = [0u8; 1024];
+
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((size, _src_addr)) => {
+                match bincode::decode_from_slice::<Quote, _>(
+                    &buf[..size],
+                    bincode::config::standard(),
+                ) {
+                    Ok((quote, _)) => {
+                        println!(
+                            "QUOTE RECEIVED: Ticker={} Price={:.4} Volume={}",
+                            quote.ticker, quote.price, quote.volume
+                        );
+                    }
+                    Err(e) => return Err(ParserError::BincodeDecode(e)),
+                }
+            }
+            Err(e) => {
+                if e.kind() == ErrorKind::ConnectionReset {
+                    continue;
+                }
+                eprintln!("Receive data error: {}", e);
+                return Err(ParserError::Format(format!("{}", e.to_string())));
+            }
+        }
+    }
+}
+
+fn main() -> Result<(), ParserError> {
     let args = Args::parse();
-    let ip = args.ip.trim().replace("\"", "").to_string();
-    let port = args.port.trim().replace("\"", "").to_string();
-    let address = format!("{ip}:{port}");
+
+    let server_ip = args.server_ip.trim().replace("\"", "").to_string();
+    let listen_port = args.listen_port.trim().replace("\"", "").to_string();
+
+    let server_address = format!("{}:{}", server_ip, SERVER_PORT);
+    let listen_address = format!("0.0.0.0:{listen_port}");
 
     let file_path = normalize_path(&args.path);
 
     if is_file_exist(&file_path) {
-        println!("Reading file: {:?}", file_path);
         let file = File::open(file_path)
             .map_err(ParserError::Io)
             .expect("Failed to open file");
         let buf = BufReader::new(file);
 
         let tickers = Ticker::parse_from_file(buf)?;
-        println!("tickers: {:?}", tickers);
+        println!("Tickers: {:?}", tickers);
 
-        let command = Command::new(&ip, &port, tickers);
-        println!("Preparing to send to the {}", address);
+        let client_socket = UdpSocket::bind(&listen_address)?;
+        let client_local_addr = client_socket.local_addr()?;
 
-        let sender = CommandSender::new("0.0.0.0:0")?;
-        sender.send_to(&command, &address)?;
-        println!("Initial command sent.");
+        let command = Command::new(
+            &client_local_addr.ip().to_string(),
+            &client_local_addr.port().to_string(),
+            tickers.clone(),
+        );
+        println!(
+            "Preparing to send J_QUOTE to {} from {}",
+            server_address, client_local_addr
+        );
 
-        let ip_clone = ip.clone();
-        let port_clone = port.clone();
-
-        spawn(move || {
-            if let Err(e) = start_ping(ip_clone, port_clone) {
-                eprintln!("КРИТИЧЕСКАЯ ОШИБКА в потоке пинга: {:?}", e);
+        match CommandSender::send_command(&client_socket, &command, &server_address) {
+            Ok(_) => {
+                println!("Initial command sent to server {}.", server_address);
             }
-        });
+            Err(e) => return Err(ParserError::Format(format!("{}", e.to_string()))),
+        };
+
+        let ping_socket = client_socket.try_clone()?;
+        let ping_command = Command::new_ping(
+            &client_local_addr.ip().to_string(),
+            &client_local_addr.port().to_string(),
+        );
+
+        CommandSender::start_ping_thread(ping_socket, server_address.clone(), ping_command);
+
+        println!("Client is running. Press Ctrl+C to exit.");
+        return start_receiver_loop(client_socket);
     }
 
-    println!("Client is running. Press Ctrl+C to exit.");
-    loop {
-        std::thread::sleep(Duration::from_secs(60));
-    }
+    Ok(())
 }
 
 fn normalize_path(raw: &str) -> PathBuf {
@@ -71,16 +135,5 @@ fn normalize_path(raw: &str) -> PathBuf {
 }
 
 fn is_file_exist(path: &PathBuf) -> bool {
-    let exists = path.exists();
-    let is_file = path.is_file();
-    println!("exists: {}, is_file: {}", exists, is_file);
-    exists && is_file
-}
-
-fn start_ping(ip: String, port: String) -> Result<(), Box<dyn std::error::Error>> {
-    let sender = CommandSender::new("0.0.0.0:0")
-        .map_err(|e| format!("Failed to create ping socket: {:?}", e))?;
-    let ping = Command::new_ping(&ip, &port);
-    sender.start_broadcasting(ip, port, ping);
-    Ok(())
+    path.exists() && path.is_file()
 }
