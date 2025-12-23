@@ -25,9 +25,9 @@ use crate::model::tickers::{Ticker, TickerParser};
 use crate::sender::CommandSender;
 use clap::Parser;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::io::ErrorKind;
-use std::net::UdpSocket;
+use std::net::{TcpStream, UdpSocket};
 use std::path::PathBuf;
 use result::Result;
 
@@ -36,7 +36,7 @@ const SERVER_PORT: &str = "8080";
 
 /// Runs a blocking loop that receives `Quote` messages from the given UDP `socket`
 /// and prints them to stdout. Returns an error if receiving or decoding fails.
-fn start_receiver_loop(socket: UdpSocket) -> Result<(), ParserError> {
+fn start_receiver_loop(mut socket: TcpStream) -> Result<(), ParserError> {
     println!(
         "Quote receiver running on the port: {}",
         socket.local_addr()?
@@ -44,19 +44,20 @@ fn start_receiver_loop(socket: UdpSocket) -> Result<(), ParserError> {
     let mut buf = [0u8; 1024];
 
     loop {
-        match socket.recv_from(&mut buf) {
-            Ok((size, _src_addr)) => {
+        match socket.read(&mut buf) {
+            Ok((size)) => {
                 match bincode::decode_from_slice::<Quote, _>(
                     &buf[..size],
                     bincode::config::standard(),
                 ) {
                     Ok((quote, _)) => {
+                        if quote.ticker == "PING" || quote.ticker == "J_QUOTE" { continue }
                         println!(
                             "QUOTE RECEIVED: Ticker={} Price={:.4} Volume={}",
                             quote.ticker, quote.price, quote.volume
                         );
                     }
-                    Err(e) => return Err(ParserError::BincodeDecode(e)),
+                    Err(_) => continue,
                 }
             }
             Err(e) => {
@@ -90,7 +91,7 @@ fn main() -> Result<(), ParserError> {
         let tickers = Ticker::parse_from_file(buf)?;
         println!("Tickers: {:?}", tickers);
 
-        let client_socket = UdpSocket::bind(&listen_address)?;
+        let mut client_socket = TcpStream::connect(&listen_address)?;
         let client_local_addr = client_socket.local_addr()?;
 
         let command = Command::new(
@@ -103,14 +104,14 @@ fn main() -> Result<(), ParserError> {
             server_address, client_local_addr
         );
 
-        match CommandSender::send_command(&client_socket, &command, &server_address) {
+        match CommandSender::send_command(&mut client_socket, &command, &server_address) {
             Ok(_) => {
                 println!("Initial command sent to server {}.", server_address);
             }
             Err(e) => return Err(ParserError::Format(format!("{}", e.to_string()))),
         };
 
-        let ping_socket = client_socket.try_clone()?;
+        let ping_socket = UdpSocket::bind(&server_address)?;
         let ping_command = Command::new_ping(
             &client_local_addr.ip().to_string(),
             &client_local_addr.port().to_string(),

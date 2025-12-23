@@ -2,10 +2,10 @@
 //!
 //! This module provides a small helper for encoding and sending `Command` messages
 //! and for running a background PING loop to keep the subscription alive.
-use std::net::UdpSocket;
+use std::net::{TcpStream, UdpSocket};
 use std::thread;
 use std::time::Duration;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use crate::error::ParserError;
 use crate::model::command::Command;
 
@@ -19,12 +19,12 @@ impl CommandSender {
     /// Encodes the provided `command` using `bincode` and sends it to `target_address`
     /// via the provided UDP `socket`.
     pub fn send_command(
-        socket: &UdpSocket,
+        socket: &mut TcpStream,
         command: &Command,
         target_address: &str,
     ) -> Result<(), ParserError> {
         let encoded = bincode::encode_to_vec(command, bincode::config::standard())?;
-        socket.send_to(&encoded, target_address)?;
+        socket.write_all(&encoded)?;
         Ok(())
     }
     
@@ -45,6 +45,7 @@ impl CommandSender {
                         continue;
                     }
                 };
+                println!("encoded: {:?}", encoded);
 
                 match socket.send_to(&encoded, &target_addr) {
                     Ok(_) => {},
