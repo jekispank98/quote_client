@@ -29,38 +29,51 @@ use std::io::{BufReader, Read};
 use std::io::ErrorKind;
 use std::net::{TcpStream, UdpSocket};
 use std::path::PathBuf;
+use std::time::Duration;
 use result::Result;
 
 /// UDP port on which the quote server is expected to listen.
-const SERVER_PORT: &str = "8080";
+/// TCP port for server commands
+const SERVER_COMMAND_PORT: &str = "8080";
+/// UDP port for server data streaming
+const SERVER_DATA_PORT: &str = "8081";
 
 /// Runs a blocking loop that receives `Quote` messages from the given UDP `socket`
 /// and prints them to stdout. Returns an error if receiving or decoding fails.
-fn start_receiver_loop(mut socket: TcpStream) -> Result<(), ParserError> {
+// main.rs - функция start_receiver_loop
+fn start_receiver_loop(socket: UdpSocket) -> Result<(), ParserError> {
     println!(
-        "Quote receiver running on the port: {}",
+        "Quote receiver running on port: {}",
         socket.local_addr()?
     );
     let mut buf = [0u8; 1024];
 
     loop {
-        match socket.read(&mut buf) {
-            Ok((size)) => {
-                match bincode::decode_from_slice::<Quote, _>(
+        match socket.recv(&mut buf) {
+            Ok(size) => {
+                // Попробуем декодировать как Quote
+                if let Ok((quote, _)) = bincode::decode_from_slice::<Quote, _>(
                     &buf[..size],
                     bincode::config::standard(),
                 ) {
-                    Ok((quote, _)) => {
-                        if quote.ticker == "PING" || quote.ticker == "J_QUOTE" { continue }
-                        println!(
-                            "QUOTE RECEIVED: Ticker={} Price={:.4} Volume={}",
-                            quote.ticker, quote.price, quote.volume
-                        );
+                    println!(
+                        "QUOTE: {} Price={:.2} Volume={} Time={}",
+                        quote.ticker, quote.price, quote.volume, quote.timestamp
+                    );
+                } else {
+                    // Если не Quote, может быть ping или другой контрольный пакет
+                    let message = String::from_utf8_lossy(&buf[..size]);
+                    if message == "PING" || message.contains("PING") {
+                        println!("Received PING from server");
+                    } else {
+                        println!("Received unknown message: {}", message);
                     }
-                    Err(_) => continue,
                 }
             }
             Err(e) => {
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut {
+                    continue;
+                }
                 if e.kind() == ErrorKind::ConnectionReset {
                     continue;
                 }
@@ -77,8 +90,12 @@ fn main() -> Result<(), ParserError> {
     let server_ip = args.server_ip.trim().replace("\"", "").to_string();
     let listen_port = args.listen_port.trim().replace("\"", "").to_string();
 
-    let server_address = format!("{}:{}", server_ip, SERVER_PORT);
-    let listen_address = format!("0.0.0.0:{listen_port}");
+    // TCP адрес сервера для команд
+    let server_command_address = format!("{}:{}", server_ip, SERVER_COMMAND_PORT); // TCP:8080
+    // UDP адрес сервера для пингов (если пинги идут на тот же порт)
+    let server_udp_address = format!("{}:{}", server_ip, SERVER_DATA_PORT); // UDP:8081
+
+    let listen_address = format!("0.0.0.0:{}", listen_port);
 
     let file_path = normalize_path(&args.path);
 
@@ -91,36 +108,55 @@ fn main() -> Result<(), ParserError> {
         let tickers = Ticker::parse_from_file(buf)?;
         println!("Tickers: {:?}", tickers);
 
-        let mut client_socket = TcpStream::connect(&listen_address)?;
-        let client_local_addr = client_socket.local_addr()?;
+        // 1. Создаем UDP сокет для получения данных
+        let client_udp_socket = UdpSocket::bind(&listen_address)?;
+        client_udp_socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let client_local_addr = client_udp_socket.local_addr()?;
 
+        println!("UDP client listening on: {}", client_local_addr);
+
+        // 2. Создаем TCP соединение для отправки команды
+        println!("Connecting to TCP server at {}", server_command_address);
+        let mut tcp_stream = TcpStream::connect(&server_command_address)
+            .map_err(|e| ParserError::Format(format!("Failed to connect to server: {}", e)))?;
+
+        // 3. Создаем команду с UDP адресом для получения данных
         let command = Command::new(
-            &client_local_addr.ip().to_string(),
-            &client_local_addr.port().to_string(),
+            &client_local_addr.ip().to_string(),  // IP клиента
+            &listen_port,                         // UDP порт сервера для данных
             tickers.clone(),
         );
+
         println!(
-            "Preparing to send J_QUOTE to {} from {}",
-            server_address, client_local_addr
+            "Preparing to send J_QUOTE to TCP server {}",
+            server_command_address
         );
 
-        match CommandSender::send_command(&mut client_socket, &command, &server_address) {
+        // 4. Отправляем команду через TCP
+        match CommandSender::send_command(&mut tcp_stream, &command) {
             Ok(_) => {
-                println!("Initial command sent to server {}.", server_address);
+                println!("Initial command sent to server {}.", server_command_address);
             }
             Err(e) => return Err(ParserError::Format(format!("{}", e.to_string()))),
         };
 
-        let ping_socket = UdpSocket::bind(&server_address)?;
+        // 5. Создаем UDP сокет для пингов
+        // Клиент должен отправлять пинги на UDP порт сервера
+        let ping_udp_socket = UdpSocket::bind("0.0.0.0:0")?; // Любой свободный порт
         let ping_command = Command::new_ping(
             &client_local_addr.ip().to_string(),
             &client_local_addr.port().to_string(),
         );
 
-        CommandSender::start_ping_thread(ping_socket, server_address.clone(), ping_command);
+        // 6. Запускаем поток для пингов (отправляем на UDP порт сервера)
+        CommandSender::start_ping_thread(
+            ping_udp_socket,
+            server_udp_address.clone(),
+            ping_command
+        );
 
         println!("Client is running. Press Ctrl+C to exit.");
-        return start_receiver_loop(client_socket);
+        return start_receiver_loop(client_udp_socket);
     }
 
     Ok(())
