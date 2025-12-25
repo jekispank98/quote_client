@@ -27,9 +27,10 @@ impl CommandSender {
             command.port,    // UDP порт клиента
             tickers_str.join(",")
         );
+        let com = bincode::encode_to_vec(command, bincode::config::standard()).unwrap();
 
         println!("Sending command: {}", command_text.trim());
-        stream.write_all(command_text.as_bytes())?;
+        stream.write_all(&com)?;
         Ok(())
     }
 

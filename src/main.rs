@@ -137,7 +137,9 @@ fn main() -> Result<(), ParserError> {
             Ok(_) => {
                 println!("Initial command sent to server {}.", server_command_address);
             }
-            Err(e) => return Err(ParserError::Format(format!("{}", e.to_string()))),
+            Err(e) => {
+                println!("Sending error to server {}.", e.to_string());
+                return Err(ParserError::Format(format!("{}", e.to_string()))) },
         };
 
         // 5. Создаем UDP сокет для пингов
